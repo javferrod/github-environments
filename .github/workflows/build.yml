@@ -1,0 +1,80 @@
+name: Build Image
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tags
+
+      - name: Get or create version tag
+        id: version
+        run: |
+          # Get the latest git tag, or create a new one if none exists
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags exist, start with v1.0.0
+            VERSION="v1.0.0"
+            echo "No existing tags found. Using initial version: $VERSION"
+          else
+            echo "Latest tag found: $LATEST_TAG"
+            VERSION="$LATEST_TAG"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Mock - Build Docker image
+        run: |
+          echo "=========================================="
+          echo "MOCK: Building Docker image"
+          echo "=========================================="
+          echo "Version: ${{ steps.version.outputs.version }}"
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          echo "Command would be:"
+          echo "  docker build -t my-app:${{ steps.version.outputs.version }} ."
+          echo ""
+          echo "Build completed successfully! ✓"
+
+      - name: Mock - Push to temporary ECR location
+        run: |
+          echo "=========================================="
+          echo "MOCK: Pushing image to temporary location"
+          echo "=========================================="
+          echo "Image: my-app:${{ steps.version.outputs.version }}"
+          echo ""
+          echo "Commands would be:"
+          echo "  aws ecr get-login-password --region us-east-1 | docker login ..."
+          echo "  docker tag my-app:${{ steps.version.outputs.version }} 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:${{ steps.version.outputs.version }}"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:${{ steps.version.outputs.version }}"
+          echo ""
+          echo "Push completed successfully! ✓"
+
+      - name: Summary
+        run: |
+          echo "### Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Build completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Go to the **Deploy** workflow" >> $GITHUB_STEP_SUMMARY
+          echo "2. Click **Run workflow**" >> $GITHUB_STEP_SUMMARY
+          echo "3. Enter version: \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "4. Start deployment to staging" >> $GITHUB_STEP_SUMMARY

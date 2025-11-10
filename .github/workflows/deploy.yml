@@ -1,0 +1,295 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (e.g., v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      staged_version: ${{ steps.tag.outputs.staged_version }}
+      rc_number: ${{ steps.tag.outputs.rc_number }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Calculate next RC number for staging
+        id: tag
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+
+          echo "=========================================="
+          echo "Calculating next RC number for staging"
+          echo "=========================================="
+          echo "Base version: $VERSION"
+          echo ""
+
+          # Mock: Query staging ECR for existing RC tags
+          echo "MOCK: Querying staging ECR for existing tags of $VERSION..."
+          echo ""
+
+          # Simulate finding existing RC tags
+          # In reality, this would query: aws ecr describe-images --repository-name my-app-staging
+          EXISTING_RCS=("$VERSION-rc0" "$VERSION-rc1")
+
+          echo "Found existing tags:"
+          for rc in "${EXISTING_RCS[@]}"; do
+            echo "  - $rc"
+          done
+          echo ""
+
+          # Find the highest RC number
+          HIGHEST_RC=-1
+          for rc in "${EXISTING_RCS[@]}"; do
+            RC_NUM=$(echo "$rc" | grep -oP 'rc\K\d+' || echo "-1")
+            if [ "$RC_NUM" -gt "$HIGHEST_RC" ]; then
+              HIGHEST_RC=$RC_NUM
+            fi
+          done
+
+          # Increment RC number
+          NEXT_RC=$((HIGHEST_RC + 1))
+          STAGED_VERSION="$VERSION-rc$NEXT_RC"
+
+          echo "Next RC number: $NEXT_RC"
+          echo "Staged version will be: $STAGED_VERSION"
+          echo ""
+
+          echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
+          echo "rc_number=$NEXT_RC" >> $GITHUB_OUTPUT
+
+      - name: Mock - Tag image in staging ECR
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Tagging image in staging ECR"
+          echo "=========================================="
+          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION"
+          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo ""
+          echo "Commands would be:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION"
+          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION \\"
+          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo ""
+          echo "Tagging completed successfully! ✓"
+
+      - name: Mock - Deploy to staging
+        run: |
+          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Deploying to staging environment"
+          echo "=========================================="
+          echo "Version: $STAGED_VERSION"
+          echo "Environment: staging"
+          echo ""
+          echo "Deployment steps would include:"
+          echo "  1. Update ECS task definition with new image"
+          echo "  2. Deploy to staging cluster"
+          echo "  3. Wait for service to become stable"
+          echo "  4. Run smoke tests"
+          echo ""
+          echo "Deployment completed successfully! ✓"
+
+      - name: Summary
+        run: |
+          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+
+          echo "### 🎯 Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`$STAGED_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** Staging" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next:** Approve deployment to **Goldenmaster** to continue the promotion flow." >> $GITHUB_STEP_SUMMARY
+
+  deploy-goldenmaster:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: goldenmaster
+    outputs:
+      goldenmaster_version: ${{ needs.deploy-staging.outputs.staged_version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mock - Tag image in goldenmaster ECR
+        run: |
+          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Tagging image in goldenmaster ECR"
+          echo "=========================================="
+          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION"
+          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
+          echo ""
+          echo "Commands would be:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION"
+          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION \\"
+          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
+          echo ""
+          echo "Note: RC number ($VERSION) is preserved from staging"
+          echo ""
+          echo "Tagging completed successfully! ✓"
+
+      - name: Mock - Deploy to goldenmaster
+        run: |
+          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Deploying to goldenmaster environment"
+          echo "=========================================="
+          echo "Version: $VERSION"
+          echo "Environment: goldenmaster"
+          echo ""
+          echo "Deployment steps would include:"
+          echo "  1. Update ECS task definition with new image"
+          echo "  2. Deploy to goldenmaster cluster"
+          echo "  3. Wait for service to become stable"
+          echo "  4. Run integration tests"
+          echo ""
+          echo "Deployment completed successfully! ✓"
+
+      - name: Summary
+        run: |
+          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "### 🏆 Goldenmaster Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** Goldenmaster" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next:** Approve deployment to **Production** to finalize the release." >> $GITHUB_STEP_SUMMARY
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-goldenmaster]
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Calculate production version
+        id: version
+        run: |
+          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          # Remove the -rcX suffix for production
+          PRODUCTION_VERSION=$(echo "$STAGED_VERSION" | sed 's/-rc[0-9]*$//')
+
+          echo "=========================================="
+          echo "Preparing production release"
+          echo "=========================================="
+          echo "Staged version: $STAGED_VERSION"
+          echo "Production version: $PRODUCTION_VERSION (RC suffix removed)"
+          echo ""
+
+          echo "production_version=$PRODUCTION_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Mock - Tag image in all ECRs (staging, goldenmaster, production)
+        run: |
+          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Tagging final production version in all ECRs"
+          echo "=========================================="
+          echo "Source: $STAGED_VERSION"
+          echo "Target: $PRODUCTION_VERSION (no RC suffix)"
+          echo ""
+
+          echo "Tagging in STAGING ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo "  docker tag ... my-app-staging:$PRODUCTION_VERSION"
+          echo "  docker push ... my-app-staging:$PRODUCTION_VERSION"
+          echo ""
+
+          echo "Tagging in GOLDENMASTER ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$STAGED_VERSION"
+          echo "  docker tag ... my-app-goldenmaster:$PRODUCTION_VERSION"
+          echo "  docker push ... my-app-goldenmaster:$PRODUCTION_VERSION"
+          echo ""
+
+          echo "Tagging in PRODUCTION ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$STAGED_VERSION"
+          echo "  docker tag ... my-app-production:$PRODUCTION_VERSION"
+          echo "  docker push ... my-app-production:$PRODUCTION_VERSION"
+          echo ""
+          echo "All ECRs tagged successfully! ✓"
+
+      - name: Mock - Deploy to production
+        run: |
+          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Deploying to production environment"
+          echo "=========================================="
+          echo "Version: $PRODUCTION_VERSION"
+          echo "Environment: production"
+          echo ""
+          echo "Deployment steps would include:"
+          echo "  1. Update ECS task definition with new image"
+          echo "  2. Deploy to production cluster"
+          echo "  3. Wait for service to become stable"
+          echo "  4. Run smoke tests"
+          echo "  5. Monitor metrics and alerts"
+          echo ""
+          echo "Deployment completed successfully! ✓"
+
+      - name: Create GitHub Release
+        run: |
+          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "MOCK: Creating GitHub Release"
+          echo "=========================================="
+          echo "Release version: $PRODUCTION_VERSION"
+          echo "Promoted from: $STAGED_VERSION"
+          echo ""
+          echo "Command would be:"
+          echo "  gh release create $PRODUCTION_VERSION \\"
+          echo "    --title \"Release $PRODUCTION_VERSION\" \\"
+          echo "    --notes \"Promoted from $STAGED_VERSION\""
+          echo ""
+          echo "Release created successfully! ✓"
+
+      - name: Summary
+        run: |
+          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "### 🎉 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`$PRODUCTION_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Promoted from:** \`$STAGED_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** Production" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Deployed & Released" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment flow complete!** 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The version \`$PRODUCTION_VERSION\` has been:" >> $GITHUB_STEP_SUMMARY
+          echo "- Tagged in all ECR repositories (staging, goldenmaster, production)" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployed to production" >> $GITHUB_STEP_SUMMARY
+          echo "- Released on GitHub" >> $GITHUB_STEP_SUMMARY
