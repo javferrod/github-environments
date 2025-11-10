@@ -9,7 +9,7 @@ on:
         type: string
 
 jobs:
-  deploy-staging:
+  prepare-staging:
     runs-on: ubuntu-latest
     environment: staging
     outputs:
@@ -26,7 +26,7 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
 
           echo "=========================================="
-          echo "Calculating next RC number for staging"
+          echo "PREPARE STAGING: Calculating next RC number"
           echo "=========================================="
           echo "Base version: $VERSION"
           echo ""
@@ -65,10 +65,22 @@ jobs:
           echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
           echo "rc_number=$NEXT_RC" >> $GITHUB_OUTPUT
 
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: prepare-staging
+    environment: staging
+    outputs:
+      staged_version: ${{ needs.prepare-staging.outputs.staged_version }}
+      rc_number: ${{ needs.prepare-staging.outputs.rc_number }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Mock - Tag image in staging ECR
         run: |
           VERSION="${{ github.event.inputs.version }}"
-          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
 
           echo "=========================================="
           echo "MOCK: Tagging image in staging ECR"
@@ -86,7 +98,7 @@ jobs:
 
       - name: Mock - Deploy to staging
         run: |
-          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
 
           echo "=========================================="
           echo "MOCK: Deploying to staging environment"
@@ -104,7 +116,7 @@ jobs:
 
       - name: Summary
         run: |
-          STAGED_VERSION="${{ steps.tag.outputs.staged_version }}"
+          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
 
           echo "### 🎯 Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -116,9 +128,36 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Next:** Approve deployment to **Goldenmaster** to continue the promotion flow." >> $GITHUB_STEP_SUMMARY
 
+  prepare-goldenmaster:
+    runs-on: ubuntu-latest
+    environment: goldenmaster
+    needs: deploy-staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mock - Run integration test suite
+        run: |
+          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+
+          echo "=========================================="
+          echo "PREPARE GOLDENMASTER: Running integration tests"
+          echo "=========================================="
+          echo "Version: $VERSION"
+          echo "Testing against staging deployment..."
+          echo ""
+          echo "Test suites:"
+          echo "  ✓ API integration tests (120/120 passed)"
+          echo "  ✓ Database integrity tests (45/45 passed)"
+          echo "  ✓ Third-party service integrations (18/18 passed)"
+          echo "  ✓ Performance benchmarks (all within thresholds)"
+          echo ""
+          echo "Integration tests completed successfully! ✓"
+
   deploy-goldenmaster:
     runs-on: ubuntu-latest
-    needs: deploy-staging
+    needs: [deploy-staging, prepare-goldenmaster]
     environment: goldenmaster
     outputs:
       goldenmaster_version: ${{ needs.deploy-staging.outputs.staged_version }}
@@ -179,10 +218,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Next:** Approve deployment to **Production** to finalize the release." >> $GITHUB_STEP_SUMMARY
 
-  deploy-production:
+  prepare-production:
     runs-on: ubuntu-latest
-    needs: [deploy-staging, deploy-goldenmaster]
+    needs: deploy-goldenmaster
     environment: production
+    outputs:
+      production_version: ${{ steps.version.outputs.production_version }}
 
     steps:
       - name: Checkout code
@@ -191,13 +232,13 @@ jobs:
       - name: Calculate production version
         id: version
         run: |
-          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          STAGED_VERSION="${{ needs.deploy-goldenmaster.outputs.goldenmaster_version }}"
 
           # Remove the -rcX suffix for production
           PRODUCTION_VERSION=$(echo "$STAGED_VERSION" | sed 's/-rc[0-9]*$//')
 
           echo "=========================================="
-          echo "Preparing production release"
+          echo "PREPARE PRODUCTION: Preparing release"
           echo "=========================================="
           echo "Staged version: $STAGED_VERSION"
           echo "Production version: $PRODUCTION_VERSION (RC suffix removed)"
@@ -205,10 +246,50 @@ jobs:
 
           echo "production_version=$PRODUCTION_VERSION" >> $GITHUB_OUTPUT
 
+      - name: Mock - Generate release notes
+        run: |
+          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          STAGED_VERSION="${{ needs.deploy-goldenmaster.outputs.goldenmaster_version }}"
+
+          echo "=========================================="
+          echo "PREPARE PRODUCTION: Generating release notes"
+          echo "=========================================="
+          echo ""
+          echo "Release: $PRODUCTION_VERSION"
+          echo "Promoted from: $STAGED_VERSION"
+          echo ""
+          echo "Release Notes:"
+          echo "---"
+          echo "## What's Changed"
+          echo "- Feature: New user dashboard"
+          echo "- Fix: Resolved authentication timeout issue"
+          echo "- Improvement: Optimized database queries"
+          echo ""
+          echo "## Performance"
+          echo "- 30% improvement in page load times"
+          echo "- 50% reduction in error rates"
+          echo ""
+          echo "## Testing"
+          echo "- 183 integration tests passed"
+          echo "- Load testing: 5000 req/s sustained"
+          echo "- Security scan: No critical vulnerabilities"
+          echo "---"
+          echo ""
+          echo "Release notes generated! ✓"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-goldenmaster, prepare-production]
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Mock - Tag image in all ECRs (staging, goldenmaster, production)
         run: |
           STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
-          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
 
           echo "=========================================="
           echo "MOCK: Tagging final production version in all ECRs"
@@ -238,7 +319,7 @@ jobs:
 
       - name: Mock - Deploy to production
         run: |
-          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
 
           echo "=========================================="
           echo "MOCK: Deploying to production environment"
@@ -257,7 +338,7 @@ jobs:
 
       - name: Create GitHub Release
         run: |
-          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
           STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
 
           echo "=========================================="
@@ -275,7 +356,7 @@ jobs:
 
       - name: Summary
         run: |
-          PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
+          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
           STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
 
           echo "### 🎉 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
