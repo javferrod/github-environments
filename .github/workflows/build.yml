@@ -1,4 +1,4 @@
-name: Build Image
+name: Build Images
 
 on:
   push:
@@ -9,8 +9,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [model, oracle]
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      # Each component outputs its version individually
+      model-version: ${{ steps.set-output.outputs.model-version }}
+      oracle-version: ${{ steps.set-output.outputs.oracle-version }}
 
     steps:
       - name: Checkout code
@@ -18,63 +23,88 @@ jobs:
         with:
           fetch-depth: 0  # Fetch all history for tags
 
-      - name: Get or create version tag
+      - name: Get or create version tag for component
         id: version
         run: |
-          # Get the latest git tag, or create a new one if none exists
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          COMPONENT="${{ matrix.component }}"
+
+          # Get the latest git tag for this component, or create a new one if none exists
+          # Tags should follow pattern: component-v1.0.0 (e.g., model-v1.0.0, oracle-v2.3.1)
+          LATEST_TAG=$(git tag -l "${COMPONENT}-v*" --sort=-v:refname | head -n 1 || echo "")
 
           if [ -z "$LATEST_TAG" ]; then
-            # No tags exist, start with v1.0.0
-            VERSION="v1.0.0"
-            echo "No existing tags found. Using initial version: $VERSION"
+            # No tags exist for this component, start with v1.0.0
+            VERSION="${COMPONENT}-v1.0.0"
+            echo "No existing tags found for $COMPONENT. Using initial version: $VERSION"
           else
-            echo "Latest tag found: $LATEST_TAG"
+            echo "Latest tag found for $COMPONENT: $LATEST_TAG"
             VERSION="$LATEST_TAG"
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
+          echo "Building $COMPONENT version: $VERSION"
 
       - name: Mock - Build Docker image
         run: |
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
           echo "=========================================="
-          echo "MOCK: Building Docker image"
+          echo "MOCK: Building Docker image for $COMPONENT"
           echo "=========================================="
-          echo "Version: ${{ steps.version.outputs.version }}"
+          echo "Component: $COMPONENT"
+          echo "Version: $VERSION"
           echo "Commit: ${{ github.sha }}"
           echo ""
           echo "Command would be:"
-          echo "  docker build -t my-app:${{ steps.version.outputs.version }} ."
+          echo "  docker build -t $COMPONENT:$VERSION -f docker/$COMPONENT/Dockerfile ."
           echo ""
           echo "Build completed successfully! ✓"
 
       - name: Mock - Push to temporary ECR location
         run: |
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
           echo "=========================================="
           echo "MOCK: Pushing image to temporary location"
           echo "=========================================="
-          echo "Image: my-app:${{ steps.version.outputs.version }}"
+          echo "Component: $COMPONENT"
+          echo "Image: $COMPONENT:$VERSION"
           echo ""
           echo "Commands would be:"
           echo "  aws ecr get-login-password --region us-east-1 | docker login ..."
-          echo "  docker tag my-app:${{ steps.version.outputs.version }} 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:${{ steps.version.outputs.version }}"
-          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:${{ steps.version.outputs.version }}"
+          echo "  docker tag $COMPONENT:$VERSION 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-builds:$VERSION"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-builds:$VERSION"
           echo ""
           echo "Push completed successfully! ✓"
 
-      - name: Summary
+      - name: Set job outputs
+        id: set-output
+        run: |
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "${COMPONENT}-version=$VERSION" >> $GITHUB_OUTPUT
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Generate build summary
         run: |
           echo "### Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Components built:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **model:** \`${{ needs.build.outputs.model-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **oracle:** \`${{ needs.build.outputs.oracle-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ✅ Build completed" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ All builds completed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
           echo "1. Go to the **Deploy** workflow" >> $GITHUB_STEP_SUMMARY
           echo "2. Click **Run workflow**" >> $GITHUB_STEP_SUMMARY
-          echo "3. Enter version: \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. Enter component versions from above" >> $GITHUB_STEP_SUMMARY
           echo "4. Start deployment to staging" >> $GITHUB_STEP_SUMMARY

@@ -3,40 +3,88 @@ name: Deploy
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to deploy (e.g., v1.0.0)'
+      model-version:
+        description: 'Model version to deploy (e.g., model-v1.0.0)'
         required: true
         type: string
+      oracle-version:
+        description: 'Oracle version to deploy (e.g., oracle-v2.0.0)'
+        required: true
+        type: string
+      components:
+        description: 'Components to deploy (comma-separated: model,oracle or leave empty for all)'
+        required: false
+        type: string
+        default: 'model,oracle'
 
 jobs:
+  # Parse component list and prepare matrix
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set up deployment matrix
+        id: set-matrix
+        run: |
+          COMPONENTS="${{ github.event.inputs.components }}"
+          # Convert comma-separated list to JSON array for matrix
+          MATRIX=$(echo "$COMPONENTS" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Deploying components: $MATRIX"
+
   prepare-staging:
     runs-on: ubuntu-latest
+    needs: setup
     environment: staging
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
     outputs:
-      staged_version: ${{ steps.tag.outputs.staged_version }}
-      rc_number: ${{ steps.tag.outputs.rc_number }}
+      model-staged-version: ${{ steps.aggregate.outputs.model-staged-version }}
+      oracle-staged-version: ${{ steps.aggregate.outputs.oracle-staged-version }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get component version from inputs
+        id: get-version
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          # Get the version for this component from workflow inputs
+          if [ "$COMPONENT" == "model" ]; then
+            VERSION="${{ github.event.inputs.model-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            VERSION="${{ github.event.inputs.oracle-version }}"
+          else
+            echo "Unknown component: $COMPONENT"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Component: $COMPONENT, Version: $VERSION"
+
       - name: Calculate next RC number for staging
         id: tag
         run: |
-          VERSION="${{ github.event.inputs.version }}"
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.get-version.outputs.version }}"
 
           echo "=========================================="
-          echo "PREPARE STAGING: Calculating next RC number"
+          echo "PREPARE STAGING: Calculating next RC number for $COMPONENT"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Base version: $VERSION"
           echo ""
 
-          # Mock: Query staging ECR for existing RC tags
-          echo "MOCK: Querying staging ECR for existing tags of $VERSION..."
+          # Mock: Query staging ECR for existing RC tags for this component
+          echo "MOCK: Querying $COMPONENT-staging ECR for existing tags of $VERSION..."
           echo ""
 
           # Simulate finding existing RC tags
-          # In reality, this would query: aws ecr describe-images --repository-name my-app-staging
+          # In reality, this would query: aws ecr describe-images --repository-name $COMPONENT-staging
           EXISTING_RCS=("$VERSION-rc0" "$VERSION-rc1")
 
           echo "Found existing tags:"
@@ -65,64 +113,126 @@ jobs:
           echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
           echo "rc_number=$NEXT_RC" >> $GITHUB_OUTPUT
 
-  deploy-staging:
+          # Save to file for aggregation
+          mkdir -p /tmp/versions
+          echo "$STAGED_VERSION" > /tmp/versions/${COMPONENT}-staged-version.txt
+
+      - name: Upload version artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-staging-version
+          path: /tmp/versions/${{ matrix.component }}-staged-version.txt
+          retention-days: 1
+
+  aggregate-staging-versions:
     runs-on: ubuntu-latest
     needs: prepare-staging
-    environment: staging
     outputs:
-      staged_version: ${{ needs.prepare-staging.outputs.staged_version }}
-      rc_number: ${{ needs.prepare-staging.outputs.rc_number }}
+      model-staged-version: ${{ steps.aggregate.outputs.model-staged-version }}
+      oracle-staged-version: ${{ steps.aggregate.outputs.oracle-staged-version }}
+    steps:
+      - name: Download all version artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/versions
+
+      - name: Aggregate versions
+        id: aggregate
+        run: |
+          MODEL_VERSION=$(cat /tmp/versions/model-staging-version/model-staged-version.txt)
+          ORACLE_VERSION=$(cat /tmp/versions/oracle-staging-version/oracle-staged-version.txt)
+
+          echo "model-staged-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
+          echo "oracle-staged-version=$ORACLE_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Aggregated versions:"
+          echo "  model: $MODEL_VERSION"
+          echo "  oracle: $ORACLE_VERSION"
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [setup, aggregate-staging-versions]
+    environment: staging
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get versions for this component
+        id: get-versions
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          # Get base version
+          if [ "$COMPONENT" == "model" ]; then
+            BASE_VERSION="${{ github.event.inputs.model-version }}"
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.model-staged-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            BASE_VERSION="${{ github.event.inputs.oracle-version }}"
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}"
+          fi
+
+          echo "base_version=$BASE_VERSION" >> $GITHUB_OUTPUT
+          echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
+
       - name: Mock - Tag image in staging ECR
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          BASE_VERSION="${{ steps.get-versions.outputs.base_version }}"
+          STAGED_VERSION="${{ steps.get-versions.outputs.staged_version }}"
 
           echo "=========================================="
-          echo "MOCK: Tagging image in staging ECR"
+          echo "MOCK: Tagging image in $COMPONENT-staging ECR"
           echo "=========================================="
-          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION"
-          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo "Component: $COMPONENT"
+          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-builds:$BASE_VERSION"
+          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$STAGED_VERSION"
           echo ""
           echo "Commands would be:"
-          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION"
-          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-builds:$VERSION \\"
-          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
-          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-builds:$BASE_VERSION"
+          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-builds:$BASE_VERSION \\"
+          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$STAGED_VERSION"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$STAGED_VERSION"
           echo ""
           echo "Tagging completed successfully! ✓"
 
       - name: Mock - Deploy to staging
         run: |
-          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          STAGED_VERSION="${{ steps.get-versions.outputs.staged_version }}"
 
           echo "=========================================="
-          echo "MOCK: Deploying to staging environment"
+          echo "MOCK: Deploying $COMPONENT to staging environment"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Version: $STAGED_VERSION"
           echo "Environment: staging"
           echo ""
           echo "Deployment steps would include:"
-          echo "  1. Update ECS task definition with new image"
+          echo "  1. Update ECS task definition for $COMPONENT with new image"
           echo "  2. Deploy to staging cluster"
-          echo "  3. Wait for service to become stable"
-          echo "  4. Run smoke tests"
+          echo "  3. Wait for $COMPONENT service to become stable"
+          echo "  4. Run smoke tests for $COMPONENT"
           echo ""
           echo "Deployment completed successfully! ✓"
 
-      - name: Summary
+  staging-summary:
+    runs-on: ubuntu-latest
+    needs: [aggregate-staging-versions, deploy-staging]
+    steps:
+      - name: Generate staging summary
         run: |
-          STAGED_VERSION="${{ needs.prepare-staging.outputs.staged_version }}"
-
           echo "### 🎯 Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** \`$STAGED_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Components deployed:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **model:** \`${{ needs.aggregate-staging-versions.outputs.model-staged-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **oracle:** \`${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** Staging" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ All components deployed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -131,23 +241,41 @@ jobs:
   prepare-goldenmaster:
     runs-on: ubuntu-latest
     environment: goldenmaster
-    needs: deploy-staging
+    needs: [setup, staging-summary, aggregate-staging-versions]
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get component version
+        id: get-version
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          if [ "$COMPONENT" == "model" ]; then
+            VERSION="${{ needs.aggregate-staging-versions.outputs.model-staged-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            VERSION="${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Mock - Run integration test suite
         run: |
-          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.get-version.outputs.version }}"
 
           echo "=========================================="
-          echo "PREPARE GOLDENMASTER: Running integration tests"
+          echo "PREPARE GOLDENMASTER: Running integration tests for $COMPONENT"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Version: $VERSION"
           echo "Testing against staging deployment..."
           echo ""
-          echo "Test suites:"
+          echo "Test suites for $COMPONENT:"
           echo "  ✓ API integration tests (120/120 passed)"
           echo "  ✓ Database integrity tests (45/45 passed)"
           echo "  ✓ Third-party service integrations (18/18 passed)"
@@ -157,29 +285,45 @@ jobs:
 
   deploy-goldenmaster:
     runs-on: ubuntu-latest
-    needs: [deploy-staging, prepare-goldenmaster]
-    outputs:
-      goldenmaster_version: ${{ needs.deploy-staging.outputs.staged_version }}
+    needs: [setup, aggregate-staging-versions, prepare-goldenmaster]
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get component version
+        id: get-version
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          if [ "$COMPONENT" == "model" ]; then
+            VERSION="${{ needs.aggregate-staging-versions.outputs.model-staged-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            VERSION="${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Mock - Tag image in goldenmaster ECR
         run: |
-          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.get-version.outputs.version }}"
 
           echo "=========================================="
-          echo "MOCK: Tagging image in goldenmaster ECR"
+          echo "MOCK: Tagging image in $COMPONENT-goldenmaster ECR"
           echo "=========================================="
-          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION"
-          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
+          echo "Component: $COMPONENT"
+          echo "Source image: 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$VERSION"
+          echo "Target: 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-goldenmaster:$VERSION"
           echo ""
           echo "Commands would be:"
-          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION"
-          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$VERSION \\"
-          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
-          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$VERSION"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$VERSION"
+          echo "  docker tag 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$VERSION \\"
+          echo "             123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-goldenmaster:$VERSION"
+          echo "  docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-goldenmaster:$VERSION"
           echo ""
           echo "Note: RC number ($VERSION) is preserved from staging"
           echo ""
@@ -187,31 +331,38 @@ jobs:
 
       - name: Mock - Deploy to goldenmaster
         run: |
-          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          VERSION="${{ steps.get-version.outputs.version }}"
 
           echo "=========================================="
-          echo "MOCK: Deploying to goldenmaster environment"
+          echo "MOCK: Deploying $COMPONENT to goldenmaster environment"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Version: $VERSION"
           echo "Environment: goldenmaster"
           echo ""
           echo "Deployment steps would include:"
-          echo "  1. Update ECS task definition with new image"
+          echo "  1. Update ECS task definition for $COMPONENT with new image"
           echo "  2. Deploy to goldenmaster cluster"
-          echo "  3. Wait for service to become stable"
-          echo "  4. Run integration tests"
+          echo "  3. Wait for $COMPONENT service to become stable"
+          echo "  4. Run integration tests for $COMPONENT"
           echo ""
           echo "Deployment completed successfully! ✓"
 
-      - name: Summary
+  goldenmaster-summary:
+    runs-on: ubuntu-latest
+    needs: [aggregate-staging-versions, deploy-goldenmaster]
+    steps:
+      - name: Generate goldenmaster summary
         run: |
-          VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
-
           echo "### 🏆 Goldenmaster Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Components deployed:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **model:** \`${{ needs.aggregate-staging-versions.outputs.model-staged-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **oracle:** \`${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** Goldenmaster" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ All components deployed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -219,156 +370,241 @@ jobs:
 
   prepare-production:
     runs-on: ubuntu-latest
-    needs: deploy-goldenmaster
+    needs: [setup, goldenmaster-summary, aggregate-staging-versions]
     environment: production
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
     outputs:
-      production_version: ${{ steps.version.outputs.production_version }}
+      model-production-version: ${{ steps.aggregate.outputs.model-production-version }}
+      oracle-production-version: ${{ steps.aggregate.outputs.oracle-production-version }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get component version
+        id: get-version
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          if [ "$COMPONENT" == "model" ]; then
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.model-staged-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}"
+          fi
+
+          echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
+
       - name: Calculate production version
         id: version
         run: |
-          STAGED_VERSION="${{ needs.deploy-goldenmaster.outputs.goldenmaster_version }}"
+          COMPONENT="${{ matrix.component }}"
+          STAGED_VERSION="${{ steps.get-version.outputs.staged_version }}"
 
           # Remove the -rcX suffix for production
           PRODUCTION_VERSION=$(echo "$STAGED_VERSION" | sed 's/-rc[0-9]*$//')
 
           echo "=========================================="
-          echo "PREPARE PRODUCTION: Preparing release"
+          echo "PREPARE PRODUCTION: Preparing release for $COMPONENT"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Staged version: $STAGED_VERSION"
           echo "Production version: $PRODUCTION_VERSION (RC suffix removed)"
           echo ""
 
           echo "production_version=$PRODUCTION_VERSION" >> $GITHUB_OUTPUT
 
+          # Save to file for aggregation
+          mkdir -p /tmp/prod-versions
+          echo "$PRODUCTION_VERSION" > /tmp/prod-versions/${COMPONENT}-production-version.txt
+
       - name: Mock - Generate release notes
         run: |
+          COMPONENT="${{ matrix.component }}"
           PRODUCTION_VERSION="${{ steps.version.outputs.production_version }}"
-          STAGED_VERSION="${{ needs.deploy-goldenmaster.outputs.goldenmaster_version }}"
+          STAGED_VERSION="${{ steps.get-version.outputs.staged_version }}"
 
           echo "=========================================="
-          echo "PREPARE PRODUCTION: Generating release notes"
+          echo "PREPARE PRODUCTION: Generating release notes for $COMPONENT"
           echo "=========================================="
           echo ""
+          echo "Component: $COMPONENT"
           echo "Release: $PRODUCTION_VERSION"
           echo "Promoted from: $STAGED_VERSION"
           echo ""
-          echo "Release Notes:"
+          echo "Release Notes for $COMPONENT:"
           echo "---"
           echo "## What's Changed"
-          echo "- Feature: New user dashboard"
-          echo "- Fix: Resolved authentication timeout issue"
-          echo "- Improvement: Optimized database queries"
+          echo "- Feature: New capabilities in $COMPONENT"
+          echo "- Fix: Resolved timeout issues"
+          echo "- Improvement: Optimized performance"
           echo ""
           echo "## Performance"
-          echo "- 30% improvement in page load times"
+          echo "- 30% improvement in processing times"
           echo "- 50% reduction in error rates"
           echo ""
           echo "## Testing"
           echo "- 183 integration tests passed"
-          echo "- Load testing: 5000 req/s sustained"
+          echo "- Load testing: Passed all benchmarks"
           echo "- Security scan: No critical vulnerabilities"
           echo "---"
           echo ""
           echo "Release notes generated! ✓"
 
+      - name: Upload production version artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-production-version
+          path: /tmp/prod-versions/${{ matrix.component }}-production-version.txt
+          retention-days: 1
+
+  aggregate-production-versions:
+    runs-on: ubuntu-latest
+    needs: prepare-production
+    outputs:
+      model-production-version: ${{ steps.aggregate.outputs.model-production-version }}
+      oracle-production-version: ${{ steps.aggregate.outputs.oracle-production-version }}
+    steps:
+      - name: Download all version artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/prod-versions
+
+      - name: Aggregate production versions
+        id: aggregate
+        run: |
+          MODEL_VERSION=$(cat /tmp/prod-versions/model-production-version/model-production-version.txt)
+          ORACLE_VERSION=$(cat /tmp/prod-versions/oracle-production-version/oracle-production-version.txt)
+
+          echo "model-production-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
+          echo "oracle-production-version=$ORACLE_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Aggregated production versions:"
+          echo "  model: $MODEL_VERSION"
+          echo "  oracle: $ORACLE_VERSION"
+
   deploy-production:
     runs-on: ubuntu-latest
-    needs: [deploy-staging, deploy-goldenmaster, prepare-production]
+    needs: [setup, aggregate-staging-versions, aggregate-production-versions]
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Get component versions
+        id: get-versions
+        run: |
+          COMPONENT="${{ matrix.component }}"
+
+          if [ "$COMPONENT" == "model" ]; then
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.model-staged-version }}"
+            PRODUCTION_VERSION="${{ needs.aggregate-production-versions.outputs.model-production-version }}"
+          elif [ "$COMPONENT" == "oracle" ]; then
+            STAGED_VERSION="${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}"
+            PRODUCTION_VERSION="${{ needs.aggregate-production-versions.outputs.oracle-production-version }}"
+          fi
+
+          echo "staged_version=$STAGED_VERSION" >> $GITHUB_OUTPUT
+          echo "production_version=$PRODUCTION_VERSION" >> $GITHUB_OUTPUT
+
       - name: Mock - Tag image in all ECRs (staging, goldenmaster, production)
         run: |
-          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
-          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
+          COMPONENT="${{ matrix.component }}"
+          STAGED_VERSION="${{ steps.get-versions.outputs.staged_version }}"
+          PRODUCTION_VERSION="${{ steps.get-versions.outputs.production_version }}"
 
           echo "=========================================="
-          echo "MOCK: Tagging final production version in all ECRs"
+          echo "MOCK: Tagging final production version for $COMPONENT in all ECRs"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Source: $STAGED_VERSION"
           echo "Target: $PRODUCTION_VERSION (no RC suffix)"
           echo ""
 
-          echo "Tagging in STAGING ECR:"
-          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-staging:$STAGED_VERSION"
-          echo "  docker tag ... my-app-staging:$PRODUCTION_VERSION"
-          echo "  docker push ... my-app-staging:$PRODUCTION_VERSION"
+          echo "Tagging in $COMPONENT-STAGING ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-staging:$STAGED_VERSION"
+          echo "  docker tag ... $COMPONENT-staging:$PRODUCTION_VERSION"
+          echo "  docker push ... $COMPONENT-staging:$PRODUCTION_VERSION"
           echo ""
 
-          echo "Tagging in GOLDENMASTER ECR:"
-          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$STAGED_VERSION"
-          echo "  docker tag ... my-app-goldenmaster:$PRODUCTION_VERSION"
-          echo "  docker push ... my-app-goldenmaster:$PRODUCTION_VERSION"
+          echo "Tagging in $COMPONENT-GOLDENMASTER ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-goldenmaster:$STAGED_VERSION"
+          echo "  docker tag ... $COMPONENT-goldenmaster:$PRODUCTION_VERSION"
+          echo "  docker push ... $COMPONENT-goldenmaster:$PRODUCTION_VERSION"
           echo ""
 
-          echo "Tagging in PRODUCTION ECR:"
-          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app-goldenmaster:$STAGED_VERSION"
-          echo "  docker tag ... my-app-production:$PRODUCTION_VERSION"
-          echo "  docker push ... my-app-production:$PRODUCTION_VERSION"
+          echo "Tagging in $COMPONENT-PRODUCTION ECR:"
+          echo "  docker pull 123456789.dkr.ecr.us-east-1.amazonaws.com/$COMPONENT-goldenmaster:$STAGED_VERSION"
+          echo "  docker tag ... $COMPONENT-production:$PRODUCTION_VERSION"
+          echo "  docker push ... $COMPONENT-production:$PRODUCTION_VERSION"
           echo ""
-          echo "All ECRs tagged successfully! ✓"
+          echo "All ECRs for $COMPONENT tagged successfully! ✓"
 
       - name: Mock - Deploy to production
         run: |
-          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
+          COMPONENT="${{ matrix.component }}"
+          PRODUCTION_VERSION="${{ steps.get-versions.outputs.production_version }}"
 
           echo "=========================================="
-          echo "MOCK: Deploying to production environment"
+          echo "MOCK: Deploying $COMPONENT to production environment"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Version: $PRODUCTION_VERSION"
           echo "Environment: production"
           echo ""
           echo "Deployment steps would include:"
-          echo "  1. Update ECS task definition with new image"
+          echo "  1. Update ECS task definition for $COMPONENT with new image"
           echo "  2. Deploy to production cluster"
-          echo "  3. Wait for service to become stable"
-          echo "  4. Run smoke tests"
+          echo "  3. Wait for $COMPONENT service to become stable"
+          echo "  4. Run smoke tests for $COMPONENT"
           echo "  5. Monitor metrics and alerts"
           echo ""
           echo "Deployment completed successfully! ✓"
 
       - name: Create GitHub Release
         run: |
-          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
-          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
+          COMPONENT="${{ matrix.component }}"
+          PRODUCTION_VERSION="${{ steps.get-versions.outputs.production_version }}"
+          STAGED_VERSION="${{ steps.get-versions.outputs.staged_version }}"
 
           echo "=========================================="
-          echo "MOCK: Creating GitHub Release"
+          echo "MOCK: Creating GitHub Release for $COMPONENT"
           echo "=========================================="
+          echo "Component: $COMPONENT"
           echo "Release version: $PRODUCTION_VERSION"
           echo "Promoted from: $STAGED_VERSION"
           echo ""
           echo "Command would be:"
           echo "  gh release create $PRODUCTION_VERSION \\"
-          echo "    --title \"Release $PRODUCTION_VERSION\" \\"
-          echo "    --notes \"Promoted from $STAGED_VERSION\""
+          echo "    --title \"Release $COMPONENT $PRODUCTION_VERSION\" \\"
+          echo "    --notes \"$COMPONENT promoted from $STAGED_VERSION\""
           echo ""
           echo "Release created successfully! ✓"
 
-      - name: Summary
+  production-summary:
+    runs-on: ubuntu-latest
+    needs: [aggregate-staging-versions, aggregate-production-versions, deploy-production]
+    steps:
+      - name: Generate production summary
         run: |
-          PRODUCTION_VERSION="${{ needs.prepare-production.outputs.production_version }}"
-          STAGED_VERSION="${{ needs.deploy-staging.outputs.staged_version }}"
-
           echo "### 🎉 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** \`$PRODUCTION_VERSION\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Promoted from:** \`$STAGED_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Components deployed:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **model:** \`${{ needs.aggregate-production-versions.outputs.model-production-version }}\` (from \`${{ needs.aggregate-staging-versions.outputs.model-staged-version }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- **oracle:** \`${{ needs.aggregate-production-versions.outputs.oracle-production-version }}\` (from \`${{ needs.aggregate-staging-versions.outputs.oracle-staged-version }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** Production" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ✅ Deployed & Released" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ All components deployed & released" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Deployment flow complete!** 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The version \`$PRODUCTION_VERSION\` has been:" >> $GITHUB_STEP_SUMMARY
+          echo "All components have been:" >> $GITHUB_STEP_SUMMARY
           echo "- Tagged in all ECR repositories (staging, goldenmaster, production)" >> $GITHUB_STEP_SUMMARY
           echo "- Deployed to production" >> $GITHUB_STEP_SUMMARY
           echo "- Released on GitHub" >> $GITHUB_STEP_SUMMARY
